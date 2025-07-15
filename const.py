@@ -17,7 +17,13 @@ class Const(metaclass=ConstMeta):
 
     # Wait time (sec) for an API call or a file download.
     # If change this value, check the rate limits of Slack APIs.
-    ACCESS_WAIT = 1.2
+    # Default wait time for most API calls
+    ACCESS_WAIT = 2.0
+    # Wait time for conversations.history and conversations.replies
+    # Non-Marketplace apps: 1 request/minute (60 seconds)
+    CONVERSATIONS_ACCESS_WAIT = 60.0
+    # Whether this is a Marketplace app (affects rate limits)
+    IS_MARKETPLACE_APP = False
     # Export Directory path.
     EXPORT_BASE_PATH = "./export"
     # Logging level for the logging module.
@@ -31,3 +37,6 @@ class Const(metaclass=ConstMeta):
     # If split, message files are saved in a format similar to official
     # functions.
     SPLIT_MESSAGE_FILES = True
+    # Maximum number of retries for rate limit errors.
+    # Set to 0 for infinite retries (recommended for complete data export).
+    MAX_RATE_LIMIT_RETRIES = 0

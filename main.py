@@ -2,9 +2,11 @@ import json
 import os
 import requests
 import shutil
+import sys
 from datetime import datetime
 from logging import basicConfig, getLogger
 from time import sleep
+import time
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -18,24 +20,211 @@ logger = getLogger(__name__)
 logger.setLevel(Const.LOG_LEVEL)
 
 
+def retry_on_rate_limit(func, *args, **kwargs):
+    """
+    Execute a function with automatic retry on rate limit errors.
+    
+    Args:
+        func: The function to execute
+        *args: Positional arguments for the function
+        **kwargs: Keyword arguments for the function
+        
+    Returns:
+        The result of the function call
+        
+    Raises:
+        SlackApiError: For non-rate-limit errors
+    """
+    retry_count = 0
+    while True:
+        try:
+            return func(*args, **kwargs)
+        except SlackApiError as e:
+            # Debug logging to understand error structure
+            logger.debug(f"SlackApiError caught: {e}")
+            logger.debug(f"Error response: {e.response}")
+            
+            # SlackApiError.response is a dict, not an object with get method
+            if isinstance(e.response, dict) and e.response.get('error') == 'ratelimited':
+                retry_count += 1
+                
+                # Try to get retry-after from different possible locations
+                retry_after = 60  # Default to 60 seconds
+                
+                # Check if retry-after is in the response headers (from HTTP response)
+                if hasattr(e, 'headers') and e.headers and 'Retry-After' in e.headers:
+                    retry_after = int(e.headers['Retry-After'])
+                    logger.debug(f"Found Retry-After in headers: {retry_after}")
+                # Check if it's in the response body
+                elif 'retry_after' in e.response:
+                    retry_after = e.response['retry_after']
+                    logger.debug(f"Found retry_after in response: {retry_after}")
+                
+                # Add exponential backoff for repeated retries
+                if retry_count > 5:
+                    retry_after = min(retry_after * (1.5 ** (retry_count - 5)), 300)  # Exponential growth, cap at 5 minutes
+                    logger.info(f"Applying exponential backoff: {retry_after} seconds")
+                
+                # Check max retry limit if configured
+                if Const.MAX_RATE_LIMIT_RETRIES > 0 and retry_count >= Const.MAX_RATE_LIMIT_RETRIES:
+                    logger.error(f"Reached maximum retry limit ({Const.MAX_RATE_LIMIT_RETRIES})")
+                    raise
+                
+                # Log appropriate message based on function name
+                func_name = func.__name__ if hasattr(func, '__name__') else 'API call'
+                logger.warning(f"Rate limited on {func_name}. Waiting {retry_after} seconds (retry #{retry_count})")
+                
+                time.sleep(retry_after)
+            else:
+                raise  # Re-raise non-rate-limit errors
+
+
+def download_file_with_retry(url, headers, timeout):
+    """
+    Download a file with automatic retry on rate limit or temporary failures.
+    
+    Args:
+        url: The URL to download from
+        headers: HTTP headers to send
+        timeout: Request timeout tuple (connect, read)
+        
+    Returns:
+        The response object if successful
+        
+    Raises:
+        Exception: For permanent failures
+    """
+    retry_count = 0
+    while True:
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=True
+            )
+            
+            if response.status_code == 200:
+                return response
+            elif response.status_code == 429:  # Rate limited
+                retry_count += 1
+                retry_after = int(response.headers.get('Retry-After', 60))
+                
+                # Add exponential backoff for repeated retries
+                if retry_count > 5:
+                    retry_after = min(retry_after * 2, 300)  # Cap at 5 minutes
+                
+                # Check max retry limit if configured
+                if Const.MAX_RATE_LIMIT_RETRIES > 0 and retry_count >= Const.MAX_RATE_LIMIT_RETRIES:
+                    logger.error(f"Reached maximum retry limit ({Const.MAX_RATE_LIMIT_RETRIES})")
+                    raise Exception(f"Failed to download after {retry_count} retries")
+                
+                logger.warning(f"File download rate limited. Waiting {retry_after} seconds (retry #{retry_count})")
+                time.sleep(retry_after)
+            else:
+                # For other errors, log details and raise
+                logger.error(f"File download failed with status {response.status_code}")
+                logger.debug(f"    URL: {url}")
+                logger.debug(f"    Headers: {response.headers}")
+                
+                if len(response.history) > 0:
+                    logger.debug(f"    Redirects: {[r.status_code for r in response.history]}")
+                    logger.debug(f"    Final URL: {response.url}")
+                
+                raise Exception(f"HTTP {response.status_code} error")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error during file download: {e}")
+            retry_count += 1
+            
+            # For network errors, retry with exponential backoff
+            if retry_count > 5:
+                wait_time = min(60 * retry_count, 300)  # Cap at 5 minutes
+            else:
+                wait_time = 10
+            
+            # Check max retry limit if configured
+            if Const.MAX_RATE_LIMIT_RETRIES > 0 and retry_count >= Const.MAX_RATE_LIMIT_RETRIES:
+                logger.error(f"Reached maximum retry limit ({Const.MAX_RATE_LIMIT_RETRIES})")
+                raise
+            
+            logger.info(f"Retrying download in {wait_time} seconds (retry #{retry_count})...")
+            time.sleep(wait_time)
+
+
 def main():
-    logger.info("---- Start Slack Data Export ----")
-
-    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Check if resuming from previous run
+    resume_timestamp = os.environ.get('SLACK_EXPORT_RESUME_TIMESTAMP')
+    if resume_timestamp:
+        logger.info("---- Resume Slack Data Export ----")
+        now = resume_timestamp
+    else:
+        logger.info("---- Start Slack Data Export ----")
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        logger.info(f"Export timestamp: {now}")
+        # Add initial delay to avoid hitting rate limits immediately
+        logger.info("Waiting 10 seconds before starting to avoid rate limits...")
+        time.sleep(10)
+    
+    logger.info(f"Rate limit retry strategy: {'Infinite retries' if Const.MAX_RATE_LIMIT_RETRIES == 0 else f'Max {Const.MAX_RATE_LIMIT_RETRIES} retries'}")
+    logger.info(f"App type: {'Marketplace' if Const.IS_MARKETPLACE_APP else 'Non-Marketplace'}")
+    if not Const.IS_MARKETPLACE_APP:
+        logger.warning("Non-Marketplace app detected. Using reduced rate limits:")
+        logger.warning(f"- conversations.history/replies: 1 request/minute (15 messages/request)")
+        logger.warning(f"- Wait time: {Const.CONVERSATIONS_ACCESS_WAIT} seconds between requests")
+    logger.info(f"General API interval: {Const.ACCESS_WAIT} seconds ({60/Const.ACCESS_WAIT:.1f} requests/minute)")
+    
     client = init_webclient()
-    users = get_users(client)
-    channels = get_accessible_channels(client, users)
+    
+    # Load progress if exists
+    progress = load_progress(now)
+    
+    if not progress.get('users_fetched', False):
+        users = get_users(client)
+        save_users(users, now)
+        save_progress(now, {'users_fetched': True})
+    else:
+        users = load_users(now)
+        logger.info("Loaded users from previous run")
+    
+    if not progress.get('channels_fetched', False):
+        channels = get_accessible_channels(client, users)
+        save_channels(channels, now)
+        save_progress(now, {'users_fetched': True, 'channels_fetched': True})
+    else:
+        channels = load_channels(now)
+        logger.info("Loaded channels from previous run")
 
-    save_users(users, now)
-    save_channels(channels, now)
-
+    processed_channels = progress.get('processed_channels', [])
+    
     for channel in channels:
-        messages = get_messages(client, channel["id"])
-        messages = sort_messages(messages)
-        save_messages(messages, channel["name"], now)
-        save_files(messages, channel["name"], now)
+        if channel["id"] in processed_channels:
+            logger.info(f"Skipping already processed channel: {channel['name']}")
+            continue
+            
+        try:
+            messages = get_messages(client, channel["id"])
+            messages = sort_messages(messages)
+            save_messages(messages, channel["name"], now)
+            save_files(messages, channel["name"], now)
+            
+            # Update progress after successful processing
+            processed_channels.append(channel["id"])
+            save_progress(now, {
+                'users_fetched': True,
+                'channels_fetched': True,
+                'processed_channels': processed_channels
+            })
+            
+        except Exception as e:
+            logger.error(f"Error processing channel {channel['name']}: {e}")
+            logger.info("Progress saved. You can resume from this point.")
+            raise
 
     archive_data(now)
+    
+    # Clean up progress file after successful completion
+    cleanup_progress(now)
 
     logger.info("---- End Slack Data Export ----")
 
@@ -60,13 +249,13 @@ def get_users(client):
 
     try:
         logger.debug("Call users_list (Slack API)")
-        users = client.users_list()["members"]
-        # logger.debug(users)
+        response = retry_on_rate_limit(client.users_list)
+        users = response["members"]
         sleep(Const.ACCESS_WAIT)
 
     except SlackApiError as e:
-        logger.error(e)
-        sleep(Const.ACCESS_WAIT)
+        logger.error(f"Failed to get users: {e}")
+        raise
 
     return users
 
@@ -79,12 +268,13 @@ def get_accessible_channels(client, users):
     try:
         while True:
             logger.debug("Call conversations_list (Slack API)")
-            conversations_list = client.conversations_list(
+            conversations_list = retry_on_rate_limit(
+                client.conversations_list,
                 types="public_channel,private_channel,mpim,im",
                 cursor=cursor,
-                limit=200)
-            # logger.debug(conversations_list)
-
+                limit=200
+            )
+            
             channels_raw.extend(conversations_list["channels"])
             sleep(Const.ACCESS_WAIT)
 
@@ -107,20 +297,28 @@ def get_accessible_channels(client, users):
         } if x["is_im"] else x for x in channels_raw]
 
     except SlackApiError as e:
-        logger.error(e)
-        sleep(Const.ACCESS_WAIT)
+        # Only log errors that weren't already handled by retry logic
+        if e.response.get('error') != 'ratelimited':
+            logger.error(e)
+        raise  # Re-raise to properly handle the error
 
     return channels
 
 
-def save_users(users, now):
-    export_path = os.path.join(*[Const.EXPORT_BASE_PATH, now])
+def ensure_export_directory(now):
+    """Ensure the export directory exists"""
+    export_path = os.path.join(Const.EXPORT_BASE_PATH, now)
     os.makedirs(export_path, exist_ok=True)
+    return export_path
+
+
+def save_users(users, now):
+    export_path = ensure_export_directory(now)
 
     logger.info("Save Users")
     logger.debug("users export path : " + export_path)
 
-    file_path = os.path.join(*[export_path, "users.json"])
+    file_path = os.path.join(export_path, "users.json")
     with open(file_path, mode="wt", encoding="utf-8") as f:
         json.dump(users, f, ensure_ascii=False, indent=2)
 
@@ -128,13 +326,12 @@ def save_users(users, now):
 
 
 def save_channels(channels, now):
-    export_path = os.path.join(*[Const.EXPORT_BASE_PATH, now])
-    os.makedirs(export_path, exist_ok=True)
+    export_path = ensure_export_directory(now)
 
     logger.info("Save Channels")
     logger.debug("channels export path : " + export_path)
 
-    file_path = os.path.join(*[export_path, "channels.json"])
+    file_path = os.path.join(export_path, "channels.json")
     with open(file_path, mode="wt", encoding="utf-8") as f:
         json.dump(channels, f, ensure_ascii=False, indent=2)
 
@@ -151,12 +348,20 @@ def get_messages(client, channel_id):
         # Stores channel's messages (other than thread's).
         while True:
             logger.debug("Call conversations_history (Slack API)")
-            conversations_history = client.conversations_history(
-                channel=channel_id, cursor=cursor, limit=200)
-            # logger.debug(conversations_history)
-
+            # Use reduced limit for non-Marketplace apps
+            limit_value = 15 if not Const.IS_MARKETPLACE_APP else 200
+            conversations_history = retry_on_rate_limit(
+                client.conversations_history,
+                channel=channel_id,
+                cursor=cursor,
+                limit=limit_value
+            )
+            
             messages.extend(conversations_history["messages"])
-            sleep(Const.ACCESS_WAIT)
+            # Use longer wait time for conversations methods if not Marketplace app
+            wait_time = Const.CONVERSATIONS_ACCESS_WAIT if not Const.IS_MARKETPLACE_APP else Const.ACCESS_WAIT
+            logger.debug(f"Waiting {wait_time} seconds before next conversations API call")
+            sleep(wait_time)
 
             cursor = fetch_next_cursor(conversations_history)
             if not cursor:
@@ -170,33 +375,41 @@ def get_messages(client, channel_id):
                 x for x in messages
                 if "thread_ts" in x and x["thread_ts"] == x["ts"]):
 
+            cursor = None  # Reset cursor for each thread
             while True:
                 logger.debug("Call conversations_replies (Slack API): " +
                              parent_message["ts"])
-                conversations_replies = client.conversations_replies(
+                # Use reduced limit for non-Marketplace apps
+                limit_value = 15 if not Const.IS_MARKETPLACE_APP else 200
+                conversations_replies = retry_on_rate_limit(
+                    client.conversations_replies,
                     channel=channel_id,
                     ts=parent_message["thread_ts"],
                     cursor=cursor,
-                    limit=200,
+                    limit=limit_value
                 )
-                # logger.debug(conversations_replies)
-
+                
                 # Since parent messages are also returned, excepts them.
                 messages.extend([
                     x for x in conversations_replies["messages"]
                     if x["ts"] != x["thread_ts"]
                 ])
-                sleep(Const.ACCESS_WAIT)
+                # Use longer wait time for conversations methods if not Marketplace app
+                wait_time = Const.CONVERSATIONS_ACCESS_WAIT if not Const.IS_MARKETPLACE_APP else Const.ACCESS_WAIT
+                logger.debug(f"Waiting {wait_time} seconds before next conversations API call")
+                sleep(wait_time)
 
-                cursor = fetch_next_cursor(conversations_history)
+                cursor = fetch_next_cursor(conversations_replies)  # Fixed: was using conversations_history
                 if not cursor:
                     break
                 else:
                     logger.debug("  next cursor: " + cursor)
 
     except SlackApiError as e:
-        logger.error(e)
-        sleep(Const.ACCESS_WAIT)
+        # Only log errors that weren't already handled by retry logic
+        if e.response.get('error') != 'ratelimited':
+            logger.error(e)
+        raise  # Re-raise to properly handle the error in main()
 
     return messages
 
@@ -217,8 +430,8 @@ def sort_messages(org_messages):
 
 
 def save_messages(messages, channel_name, now):
-    export_path = os.path.join(*[Const.EXPORT_BASE_PATH, now, channel_name])
-    os.makedirs(export_path)
+    export_path = os.path.join(Const.EXPORT_BASE_PATH, now, channel_name)
+    os.makedirs(export_path, exist_ok=True)
 
     logger.info("Save Messages of " + channel_name)
     logger.debug("messages export path : " + export_path)
@@ -235,12 +448,11 @@ def save_messages(messages, channel_name, now):
                 x for x in messages if format_ts(x["ts"]) == day_ts
             ]
 
-            file_path = os.path.join(
-                *[export_path, "".join([day_ts, ".json"])])
-            with open(file_path, mode="at", encoding="utf-8") as f:
+            file_path = os.path.join(export_path, f"{day_ts}.json")
+            with open(file_path, mode="wt", encoding="utf-8") as f:
                 json.dump(day_messages, f, ensure_ascii=False, indent=2)
     else:
-        file_path = os.path.join(*[export_path, "messages.json"])
+        file_path = os.path.join(export_path, "messages.json")
         with open(file_path, mode="wt", encoding="utf-8") as f:
             json.dump(messages, f, ensure_ascii=False, indent=2)
 
@@ -252,9 +464,8 @@ def format_ts(unix_time_str):
 
 
 def save_files(messages, channel_name, now):
-    export_path = os.path.join(
-        *[Const.EXPORT_BASE_PATH, now, channel_name, "files"])
-    os.makedirs(export_path)
+    export_path = os.path.join(Const.EXPORT_BASE_PATH, now, channel_name, "files")
+    os.makedirs(export_path, exist_ok=True)
 
     logger.info("Save Files of " + channel_name)
     logger.debug("files export path : " + export_path)
@@ -267,45 +478,29 @@ def save_files(messages, channel_name, now):
             logger.debug("  * Download " + fi["name"])
 
             try:
-                response = requests.get(
+                response = download_file_with_retry(
                     fi["url_private"],
                     headers={"Authorization": "Bearer " + token},
                     timeout=(Const.REQUESTS_CONNECT_TIMEOUT,
-                             Const.REQUESTS_READ_TIMEOUT))
-                sleep(Const.ACCESS_WAIT)
-
-                # If the token's scope doesn't include "files:read", this
-                # request should be redirected.
-                if len(response.history) != 0:
-                    logger.warning("File downloads may fail.")
-                    logger.warning(
-                        "Check if the list of scopes includes 'files:read'.")
-
-                # NOTE: Content-Type is often set to "binary/octet-stream"
-                #       regardless of the file type, so don't "continues" even
-                #       if Content-Type and mimetype mismatch.
-                # if fi["mimetype"] != response.headers["Content-Type"]:
-                #     logger.debug("        mimetype    : " + fi["mimetype"])
-                #     logger.debug("        content-type: " +
-                #                  response.headers["Content-Type"])
-                #     continue
-
-                file_path = os.path.join(
-                    *[export_path, "".join([fi["id"], "_", fi["name"]])])
+                             Const.REQUESTS_READ_TIMEOUT)
+                )
+                
+                file_path = os.path.join(export_path, f"{fi['id']}_{fi['name']}")
                 with open(file_path, mode="wb") as f:
                     f.write(response.content)
-
-            except (requests.exceptions.Timeout,
-                    requests.exceptions.RequestException) as e:
-                logger.error(e)
-                logger.error("url_private : " + fi["url_private"])
-                sleep(Const.ACCESS_WAIT)
+                logger.debug(f"    Successfully downloaded {fi['name']}")
+                
+            except Exception as e:
+                logger.error(f"Failed to download {fi['name']}: {e}")
+                logger.error(f"URL: {fi['url_private']}")
+            
+            sleep(Const.ACCESS_WAIT)
 
     return None
 
 
 def archive_data(now):
-    root_path = os.path.join(*[Const.EXPORT_BASE_PATH, now])
+    root_path = os.path.join(Const.EXPORT_BASE_PATH, now)
 
     logger.info("Archive data")
 
@@ -315,5 +510,71 @@ def archive_data(now):
     return None
 
 
+def save_progress(now, progress_data):
+    """Save progress to a JSON file for resume capability"""
+    progress_path = os.path.join(Const.EXPORT_BASE_PATH, f".progress_{now}.json")
+    with open(progress_path, 'w', encoding='utf-8') as f:
+        json.dump(progress_data, f, ensure_ascii=False, indent=2)
+
+
+def load_progress(now):
+    """Load progress from a previous run if it exists"""
+    progress_path = os.path.join(Const.EXPORT_BASE_PATH, f".progress_{now}.json")
+    if os.path.exists(progress_path):
+        with open(progress_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    
+    # Check for any recent progress files
+    progress_files = [f for f in os.listdir(Const.EXPORT_BASE_PATH) if f.startswith('.progress_')]
+    if progress_files:
+        # Sort by modification time and get the most recent
+        progress_files.sort(key=lambda x: os.path.getmtime(os.path.join(Const.EXPORT_BASE_PATH, x)), reverse=True)
+        most_recent = progress_files[0]
+        logger.info(f"Found previous progress file: {most_recent}")
+        logger.info("Use --resume flag or rename the progress file to match current timestamp to resume")
+    
+    return {}
+
+
+def cleanup_progress(now):
+    """Remove progress file after successful completion"""
+    progress_path = os.path.join(Const.EXPORT_BASE_PATH, f".progress_{now}.json")
+    if os.path.exists(progress_path):
+        os.remove(progress_path)
+        logger.info("Progress file cleaned up")
+
+
+def load_users(now):
+    """Load users from previously saved file"""
+    file_path = os.path.join(Const.EXPORT_BASE_PATH, now, "users.json")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Users file not found: {file_path}")
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def load_channels(now):
+    """Load channels from previously saved file"""
+    file_path = os.path.join(Const.EXPORT_BASE_PATH, now, "channels.json")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Channels file not found: {file_path}")
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == '--resume':
+        # Find the most recent progress file
+        progress_files = [f for f in os.listdir(Const.EXPORT_BASE_PATH) if f.startswith('.progress_')]
+        if progress_files:
+            progress_files.sort(key=lambda x: os.path.getmtime(os.path.join(Const.EXPORT_BASE_PATH, x)), reverse=True)
+            # Extract timestamp from filename
+            timestamp = progress_files[0].replace('.progress_', '').replace('.json', '')
+            logger.info(f"Resuming export from {timestamp}")
+            # Set resume mode with existing timestamp
+            os.environ['SLACK_EXPORT_RESUME_TIMESTAMP'] = timestamp
+        else:
+            logger.error("No progress file found to resume from.")
+            sys.exit(1)
+    
     main()
